@@ -71,28 +71,31 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-        // 获取张量的长度
-        let len = x.size();
-        assert!(len == y.size() && len == w.size(), "x, y, and w must have the same size");
-    
-        // 获取底层数据
-        let x_data = x.data();
-        let w_data = w.data();
-        let y_data = unsafe { y.data_mut() };
-    
-        // 计算平方和
-        let mut sum_of_squares = 0.0;
-        for i in 0..len {
-            sum_of_squares += x_data[i] * x_data[i];
+    assert_eq!(y.shape(), x.shape(), "shape of x, y should be the same");
+    assert!(
+        y.shape().len() == 2 && x.shape().len() == 2,
+        "y and x should be just a 2d matrix right now"
+    );
+    assert_eq!(w.shape().len(), 1, "shape of x should be 1 dim");
+    assert_eq!(
+        *y.shape().last().unwrap(),
+        w.size(),
+        "dim of features of x, y should be the same as the dim of w"
+    );
+    let batch_size = y.shape()[0];
+    let features = y.shape()[1];
+    for i in 0..batch_size {
+        let mut sum_sq = 0.0f32;
+        for j in 0..features {
+            let xij = x.data()[i * features + j];
+            sum_sq += xij * xij;
         }
-    
-        // 计算 RMS（Root Mean Square）
-        let rms = (sum_of_squares / len as f32).sqrt();
-    
-        // 归一化并应用权重
-        for i in 0..len {
-            y_data[i] = w_data[i] * (x_data[i] / (rms + epsilon));
+        let rms = (sum_sq / features as f32).sqrt();
+        for j in 0..features {
+            let _y = unsafe { y.data_mut() };
+            _y[i * features + j] = x.data()[i * features + j] / (rms + epsilon) * w.data()[j];
         }
+    }
 }
 
 // y = silu(x) * y
