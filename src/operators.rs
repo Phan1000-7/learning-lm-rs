@@ -130,7 +130,132 @@ pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    assert!(
+        b.shape().len() == 2,
+        "matmul_transb of dimensions must be at least 2"
+    );
+    assert!(
+        a.shape().len() == 2,
+        "matmul_transb of dimensions must be at least 2"
+    );
+    if a.shape()[1] != b.shape()[1] {
+        panic!("matmul_transb of 大小不相同");
+    }
+
+    let shape = vec![a.shape()[0], b.shape()[0]];
+    let mid = a.shape()[1];
+    let c_data = unsafe { c.data_mut() };
+    let mut offset = 0;
+
+    for i in 0..shape[0] {
+        let row = &a.data()[i * mid..(i + 1) * mid];
+        for j in 0..shape[1] {
+            let column = &b.data()[j * mid..(j + 1) * mid];
+            c_data[offset] = alpha * row.iter().zip(column).map(|(a, b)| a * b).sum::<f32>()
+                + c_data[offset] * beta;
+            offset += 1;
+        }
+    }
+}
+
+pub fn vec_multi(c: &mut Tensor<f32>, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32, t: bool) {
+    // 判断c，长度是否大于二
+    assert!(
+        c.shape().len() > 2,
+        "vec_multi of dimensions must be at least 2"
+    );
+    // a 重要，用于切分数据
+    assert!(a.shape().len() == 2, "vec_multi of dimensions must be 2");
+    assert!(b.shape().len() == 2, "vec_multi of dimensions must be 2");
+    let shape = c.shape();
+    // 获取矩阵的行列数
+    let (row, column) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    // 获取n_q_h，用于分组
+    let q_head_len = shape[..shape.len() - 2].iter().product::<usize>();
+    // 确定qk的倍数对应关系
+    let q_k_reflect = a.shape()[1] / b.shape()[1];
+    let vec_len = a.shape()[1] / q_head_len;
+    let a_data = a.data();
+    // 用于获取q_head需要进行跳过的数值
+    let a_skip = a.shape()[1];
+    let b_data = b.data();
+    // 用于获取k_head需要进行跳过的数值
+    let b_skip = b.shape()[1];
+    let data = unsafe { c.data_mut() };
+    // 清理脏数据
+    data.fill(0.);
+    let mut c_data_offset = 0;
+    if t {
+        // 用于分组计算，每个输入，在每个请求头下的vjiv
+        for i in 0..q_head_len {
+            // 计算一个输入值，在一个请求头下的total中的所有v
+            for j in 0..row {
+                // 临时q_head 值,j*a_skip用于跳过多头i*16用于跳过单头
+                let a_tmp =
+                    &a_data[(i * vec_len + j * a_skip)..(i * vec_len + j * a_skip) + vec_len];
+                // 计算单一v
+                for k in 0..column {
+                    let b_tmp = &b_data[(k * b_skip + (i / q_k_reflect) * vec_len)
+                        ..(k * b_skip + (i / q_k_reflect) * vec_len) + vec_len];
+                    data[c_data_offset] = a_tmp
+                        .iter()
+                        .zip(b_tmp.iter())
+                        .fold(0., |tmp, (a_val, b_val)| tmp + a_val * b_val)
+                        * alpha;
+                    c_data_offset += 1;
+                }
+            }
+        }
+    }
+}
+
+pub fn vec_multi_wight(c: &mut Tensor<f32>, a: &Tensor<f32>, b: &Tensor<f32>) {
+    assert!(
+        b.shape().len() == 2,
+        "matmul_transb of dimensions must be at least 2"
+    );
+    assert!(
+        a.shape().len() == 4,
+        "matmul_transb of dimensions must be  4 是att_scores)"
+    );
+    let q_header_len = a.shape()[..a.shape().len() - 2].iter().product::<usize>();
+    let shape = a.shape();
+    // 获取矩阵的行列数
+    let (row, column) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    // 获取计算向量的长度
+    let vec_len = b.shape()[1] / a.shape()[0];
+    // 确认a，b需要的对应关系,默认a的长度大于b的长度
+    let n_groups = a.shape()[1];
+    let b_column = b.shape()[1];
+    let mut data = unsafe { c.data_mut() };
+    // 清理脏数据
+    data.fill(0.);
+    for i in 0..q_header_len {
+        // 获取当前q下的的全部注意力
+        let a_data = &a.data()[i * row * column..(i + 1) * row * column];
+        // 循环计算每个当前q下，每个输入的v权重
+        for c_i in 0..row {
+            // 用于标记当前计算到那一列
+            let mut b_data_row_offset = 0;
+            let tmp_c_offset = n_groups * b_column * c_i + i * vec_len;
+            // 获取c存储当先向量的位置，
+            let tmp_c = &mut data[tmp_c_offset..tmp_c_offset + vec_len];
+            // 获取一个输入的全部注意力
+            a_data[c_i * column..(c_i + 1) * column]
+                .iter()
+                .for_each(|tmp| {
+                    // 获取q，对应的v b_data_row_offset*b_column表示要跳过的input
+                    // (q_header_len/n_groups)*vec_len 表示q对应的v
+                    let tmp_offset = b_data_row_offset * b_column + (i / n_groups) * vec_len;
+                    let b_data = &b.data()[tmp_offset..tmp_offset + vec_len];
+                    b_data.iter().zip(tmp_c.iter_mut()).for_each(|(t_b, t_c)| {
+                        *t_c += t_b * tmp;
+                    });
+                    // 进行偏移
+                    b_data_row_offset += 1;
+                });
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
