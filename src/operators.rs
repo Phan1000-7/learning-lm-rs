@@ -1,5 +1,7 @@
-use crate::tensor::Tensor;
+use std::{borrow::BorrowMut, f32::consts::SQRT_2, vec};
 
+use crate::tensor::Tensor;
+/// 获取编码后，每个词代表的向量，组成一个矩阵
 // get (row) vectors from a 2D table given a list of indices
 pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
     let length = indices.size();
@@ -44,6 +46,7 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
     assert!(ndim >= 2);
     let seq_len = y.shape()[ndim - 2];
     let total_seq_len = y.shape()[ndim - 1];
+    // 获取n_q_h
     let batch = y.size() / (seq_len * total_seq_len);
     let data = unsafe { y.data_mut() };
     for b in 0..batch {
@@ -71,59 +74,44 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    assert_eq!(y.shape(), x.shape(), "shape of x, y should be the same");
-    assert!(
-        y.shape().len() == 2 && x.shape().len() == 2,
-        "y and x should be just a 2d matrix right now"
-    );
-    assert_eq!(w.shape().len(), 1, "shape of x should be 1 dim");
-    assert_eq!(
-        *y.shape().last().unwrap(),
-        w.size(),
-        "dim of features of x, y should be the same as the dim of w"
-    );
-    let batch_size = y.shape()[0];
-    let features = y.shape()[1];
-    for i in 0..batch_size {
-        let mut sum_sq = 0.0f32;
-        for j in 0..features {
-            let xij = x.data()[i * features + j];
-            sum_sq += xij * xij;
-        }
-        let rms = (sum_sq / features as f32).sqrt();
-        for j in 0..features {
-            let _y = unsafe { y.data_mut() };
-            _y[i * features + j] = x.data()[i * features + j] / (rms + epsilon) * w.data()[j];
-        }
+    let y_data = unsafe { y.data_mut() };
+
+    let mut shape = vec![];
+    // 判断是否是一维
+    if x.shape().len() == 1 {
+        shape.push(1);
+        shape.push(x.shape()[0]);
+    } else {
+        shape = x.shape().clone();
+    }
+    for i in 0..shape[0] {
+        let row_range = i * shape[1]..(i + 1) * shape[1];
+        let sq = ((x.data()[row_range.clone()]
+            .iter()
+            .map(|&x| x.powi(2))
+            .sum::<f32>()
+            / shape[1] as f32)
+            + epsilon)
+            .sqrt();
+        y_data[row_range.clone()]
+            .iter_mut()
+            .zip(x.data()[row_range].iter().zip(w.data().iter()))
+            .for_each(|(y_d, (x_d, w_d))| {
+                *y_d = (*w_d * *x_d) / sq;
+            });
     }
 }
 
-// y = silu(x) * y
+// y = sigmoid(x) * x * y
 // hint: this is an element-wise operation
-#[inline]
-fn silu(x: f32) -> f32 {
-    x * sigmoid(x)
-}
-
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
-
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
-
+pub fn silu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
     let len = y.size();
     assert!(len == x.size());
 
     let y_data = unsafe { y.data_mut() };
     let x_data = x.data();
-    for i in 0..len {
-        let silu_x = silu(x_data[i]);
-        y_data[i] *= silu_x;
+    for i in 0..x_data.len() {
+        y_data[i] = y_data[i] * x_data[i] / (1.0 + (-x_data[i]).exp())
     }
 }
 
@@ -141,7 +129,8 @@ pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor
     if a.shape()[1] != b.shape()[1] {
         panic!("matmul_transb of 大小不相同");
     }
-
+    // 计算 num 是 multiple 的几倍
+    // 默认当二维数组处理
     let shape = vec![a.shape()[0], b.shape()[0]];
     let mid = a.shape()[1];
     let c_data = unsafe { c.data_mut() };
@@ -157,7 +146,8 @@ pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor
         }
     }
 }
-
+// 向量乘法
+// t判断是否需要转置,alpha,参数暂未使用
 pub fn vec_multi(c: &mut Tensor<f32>, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32, t: bool) {
     // 判断c，长度是否大于二
     assert!(
@@ -208,7 +198,8 @@ pub fn vec_multi(c: &mut Tensor<f32>, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f
         }
     }
 }
-
+// 只用于得分计算
+// a代表所处理的权重,b代表所要乘的向量
 pub fn vec_multi_wight(c: &mut Tensor<f32>, a: &Tensor<f32>, b: &Tensor<f32>) {
     assert!(
         b.shape().len() == 2,
@@ -342,7 +333,7 @@ pub fn random_sample(x: &Tensor<f32>, top_p: f32, top_k: u32, temperature: f32) 
 fn test_silu() {
     let mut y = Tensor::<f32>::new(vec![2., 3., 4.], &vec![1, 3]);
     let x = Tensor::<f32>::new(vec![1., 2., 3.], &vec![1, 3]);
-    swiglu(&mut y, &x);
+    silu(&mut y, &x);
     assert!(y.close_to(
         &Tensor::<f32>::new(vec![1.4621172, 5.2847824, 11.43089], &vec![1, 3]),
         1e-3
